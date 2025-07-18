@@ -14,7 +14,7 @@ import os
 import re
 import tempfile
 import shutil
-from pydub import AudioSegment
+# from pydub import AudioSegment  # Removed to reduce package size
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -31,10 +31,10 @@ SILENCE_THRESHOLD = -40
 MIN_SILENCE_DURATION = 1000
 CHUNK_SIZE = 300
 MAX_AUDIO_LENGTH = 1800
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = "/tmp"  # Use /tmp for Vercel serverless
 
-# Create directories
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Create directories (not needed for /tmp)
+# os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Global model variable (loaded once)
 whisper_model = None
@@ -83,6 +83,18 @@ async def transcribe_audio(file: UploadFile = File(...),language: Optional[str] 
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
+        )
+
+    # Check file size (50MB limit for Vercel)
+    max_size = 50 * 1024 * 1024  # 50MB
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
+
+    if file_size > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size: {max_size // (1024*1024)}MB"
         )
 
     # Generate unique filename
@@ -134,52 +146,9 @@ async def transcribe_audio(file: UploadFile = File(...),language: Optional[str] 
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 def preprocess_audio(audio_path):
-    """Preprocess audio for optimal Whisper performance"""
-    print("🔧 Preprocessing audio...")
-    
-    try:
-        audio = AudioSegment.from_file(audio_path)
-        duration_seconds = len(audio) / 1000
-        print(f"   Duration: {duration_seconds:.1f} seconds")
-        
-        # Convert to mono
-        if audio.channels > 1:
-            audio = audio.set_channels(1)
-        
-        # Resample to 16kHz
-        if audio.frame_rate != TARGET_SAMPLE_RATE:
-            audio = audio.set_frame_rate(TARGET_SAMPLE_RATE)
-        
-        # Normalize and trim silence
-        audio = audio.normalize()
-        audio = audio.strip_silence(silence_len=1000, silence_thresh=SILENCE_THRESHOLD)
-        
-        # Handle long audio
-        if duration_seconds > MAX_AUDIO_LENGTH:
-            return split_audio_into_chunks(audio)
-        
-        # Save optimized audio
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-        audio.export(temp_file.name, format='wav')
-        return temp_file.name
-        
-    except Exception as e:
-        print(f"⚠️ Audio preprocessing failed: {e}")
-        return audio_path
-
-def split_audio_into_chunks(audio):
-    """Split long audio into manageable chunks"""
-    chunks = []
-    chunk_length_ms = CHUNK_SIZE * 1000
-    
-    for i in range(0, len(audio), chunk_length_ms):
-        chunk = audio[i:i + chunk_length_ms]
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-        chunk.export(temp_file.name, format='wav')
-        chunks.append(temp_file.name)
-    
-    print(f"   Split into {len(chunks)} chunks")
-    return chunks
+    """Simple audio preprocessing - just return the original file for Vercel"""
+    print("🔧 Using original audio file (no preprocessing for Vercel)")
+    return audio_path
 
 def transcribe_fast(model, audio_path, language="en"):
     """Fast transcription with optimized settings"""
@@ -426,6 +395,9 @@ def cleanup_temp_files(file_paths):
                 os.unlink(path)
         except:
             pass
+
+# For Vercel deployment
+handler = app
 
 if __name__ == "__main__":
     import uvicorn
