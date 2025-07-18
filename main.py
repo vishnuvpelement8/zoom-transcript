@@ -14,11 +14,9 @@ import os
 import re
 import tempfile
 import shutil
-import numpy as np
 from pydub import AudioSegment
 import uuid
 from pathlib import Path
-import asyncio
 from typing import Optional
 
 app = FastAPI(
@@ -47,8 +45,10 @@ async def startup_event():
     global whisper_model
     print("🔄 Loading Whisper model...")
     try:
-        whisper_model = whisper.load_model("base")
-        print("✅ Whisper model loaded successfully")
+        # Use tiny model for Vercel deployment to reduce package size
+        model_name = os.getenv("WHISPER_MODEL_NAME", "tiny")
+        whisper_model = whisper.load_model(model_name)
+        print(f"✅ Whisper model '{model_name}' loaded successfully")
     except Exception as e:
         print(f"❌ Failed to load Whisper model: {e}")
         raise

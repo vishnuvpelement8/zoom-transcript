@@ -1,0 +1,67 @@
+# Development files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.git/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+uploads/
+logs/
+*.docx
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.flac
+*.ogg
+test_*
+sample*
+audio*
+
+# Documentation and config files not needed in production
+README.md
+.env.example
+test_main.py
+config.py
+logging_config.py
+middleware.py
+exceptions.py
+models.py
+
+# Large dependencies that will be installed by Vercel
+torch/
+torchaudio/

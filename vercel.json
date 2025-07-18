@@ -2,19 +2,27 @@
   "version": 2,
   "builds": [
     {
-      "src": "main.py",
-      "use": "@vercel/python"
+      "src": "main_vercel.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb"
+      }
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "main.py"
+      "dest": "main_vercel.py"
     }
   ],
   "env": {
     "PYTHONPATH": ".",
-    "DEBUG": "false",
-    "LOG_LEVEL": "INFO"
+    "WHISPER_MODEL_NAME": "tiny"
+  },
+  "functions": {
+    "main_vercel.py": {
+      "maxDuration": 300,
+      "memory": 3008
+    }
   }
 }
