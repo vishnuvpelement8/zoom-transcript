@@ -33,7 +33,7 @@ class TranscriptionRequest(BaseModel):
     )
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "language": "en"
             }
@@ -58,7 +58,7 @@ class HealthCheckResponse(BaseModel):
     checks: Dict[str, Any] = Field(default_factory=dict)
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "status": "healthy",
                 "message": "Zoom Meeting Transcript API is running",
@@ -117,7 +117,7 @@ class TranscriptionResponse(BaseModel):
     segments: List[TranscriptionSegment] = Field(description="Transcription segments")
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "request_id": "550e8400-e29b-41d4-a716-446655440000",
                 "filename": "meeting_recording.m4a",
@@ -160,7 +160,7 @@ class ErrorResponse(BaseModel):
     timestamp: datetime = Field(description="Error timestamp")
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "error": {
                     "code": "INVALID_FILE_TYPE",
@@ -217,7 +217,7 @@ class JobStatus(BaseModel):
     error: Optional[ErrorDetail] = Field(description="Error information if failed")
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "job_id": "550e8400-e29b-41d4-a716-446655440000",
                 "status": "processing",

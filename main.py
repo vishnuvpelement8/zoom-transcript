@@ -4,645 +4,187 @@ FastAPI Zoom Meeting Transcript Generator
 Upload audio files via POST request to get transcripts
 """
 
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+import whisper
+from docx import Document
+from datetime import datetime
 import os
 import re
 import tempfile
 import shutil
-import uuid
-import asyncio
-import time
-from pathlib import Path
-from datetime import datetime
-from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
-
-import whisper
 import numpy as np
 from pydub import AudioSegment
-from docx import Document
+import uuid
+from pathlib import Path
+import asyncio
+from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Depends, Query
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from starlette.background import BackgroundTask
-from starlette.middleware.base import BaseHTTPMiddleware
-
-# Local imports
-from config import get_settings, Settings, is_allowed_file_extension, format_file_size
-from logging_config import setup_logging, get_logger, log_request_start, log_request_end, log_error
-from exceptions import (
-    FileValidationError, AudioProcessingError, TranscriptionError, ModelLoadError,
-    BadRequestException, InternalServerErrorException, ServiceUnavailableException,
-    ErrorCodes, create_error_response
-)
-from models import (
-    TranscriptionRequest, HealthCheckResponse, HealthStatus,
-    TranscriptionResponse, ErrorResponse, FileUploadInfo
-)
-from middleware import (
-    RateLimitMiddleware, SecurityHeadersMiddleware,
-    RequestSizeLimitMiddleware, ErrorHandlingMiddleware
-)
-
-# Initialize logging
-setup_logging()
-logger = get_logger(__name__)
-
-# Global variables
-whisper_model = None
-app_start_time = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan event handler for startup and shutdown"""
-    global whisper_model, app_start_time
-
-    # Startup
-    app_start_time = time.time()
-    settings = get_settings()
-
-    logger.info("Starting Zoom Meeting Transcript API", extra={
-        "version": settings.app_version,
-        "whisper_model": settings.whisper_model_name,
-        "device": settings.whisper_device
-    })
-
-    try:
-        logger.info(f"Loading Whisper model: {settings.whisper_model_name}")
-        whisper_model = whisper.load_model(
-            settings.whisper_model_name,
-            device=settings.whisper_device
-        )
-        logger.info("Whisper model loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load Whisper model: {str(e)}", exc_info=True)
-        raise ModelLoadError(f"Failed to load Whisper model: {str(e)}")
-
-    # Create required directories
-    os.makedirs(settings.upload_dir, exist_ok=True)
-    if settings.temp_dir:
-        os.makedirs(settings.temp_dir, exist_ok=True)
-
-    logger.info("Application startup completed")
-
-    yield
-
-    # Shutdown
-    logger.info("Shutting down application")
-    # Cleanup resources if needed
-
-
-def get_app_settings() -> Settings:
-    """Dependency to get application settings"""
-    return get_settings()
-
-
-# Create FastAPI app
-settings = get_settings()
 app = FastAPI(
-    title=settings.app_name,
-    description=settings.app_description,
-    version=settings.app_version,
-    lifespan=lifespan,
-    docs_url="/docs" if settings.debug else None,
-    redoc_url="/redoc" if settings.debug else None,
-    openapi_tags=[
-        {
-            "name": "health",
-            "description": "Health check and system status endpoints"
-        },
-        {
-            "name": "transcription",
-            "description": "Audio transcription endpoints"
-        }
-    ],
-    contact={
-        "name": "API Support",
-        "email": "support@example.com",
-    },
-    license_info={
-        "name": "MIT",
-        "url": "https://opensource.org/licenses/MIT",
-    },
+    title="Zoom Meeting Transcript API",
+    description="Upload audio files to get meeting transcripts",
+    version="1.0.0"
 )
 
-# Add middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
+# Configuration
+TARGET_SAMPLE_RATE = 16000
+SILENCE_THRESHOLD = -40
+MIN_SILENCE_DURATION = 1000
+CHUNK_SIZE = 300
+MAX_AUDIO_LENGTH = 1800
+UPLOAD_DIR = "uploads"
 
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=settings.allowed_hosts
-)
+# Create directories
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Add custom middleware (order matters - last added is executed first)
-app.add_middleware(ErrorHandlingMiddleware)
-app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(RequestSizeLimitMiddleware)
-# Note: Rate limiting is handled by Vercel in production
-if settings.debug:
-    app.add_middleware(RateLimitMiddleware)
+# Global model variable (loaded once)
+whisper_model = None
 
-
-class RequestTrackingMiddleware(BaseHTTPMiddleware):
-    """Middleware to track requests and add request IDs"""
-
-    async def dispatch(self, request: Request, call_next):
-        # Generate request ID
-        request_id = str(uuid.uuid4())
-        request.state.request_id = request_id
-
-        # Log request start
-        start_time = time.time()
-        log_request_start(
-            logger,
-            request_id,
-            str(request.url.path),
-            request.method
-        )
-
-        # Process request
-        try:
-            response = await call_next(request)
-
-            # Log successful completion
-            duration = time.time() - start_time
-            log_request_end(
-                logger,
-                request_id,
-                str(request.url.path),
-                request.method,
-                response.status_code,
-                duration
-            )
-
-            # Add request ID to response headers
-            response.headers["X-Request-ID"] = request_id
-            return response
-
-        except Exception as e:
-            # Log error
-            duration = time.time() - start_time
-            log_error(logger, request_id, e, "request_processing")
-
-            # Re-raise the exception
-            raise
-
-
-# Add request tracking middleware
-app.add_middleware(RequestTrackingMiddleware)
-
-
-# Exception handlers
-@app.exception_handler(FileValidationError)
-async def file_validation_exception_handler(request: Request, exc: FileValidationError):
-    """Handle file validation errors"""
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-
-    error_response = create_error_response(
-        ErrorCodes.VALIDATION_ERROR,
-        str(exc),
-        details=exc.details,
-        request_id=request_id
-    )
-    error_response["error"]["timestamp"] = datetime.now(datetime.timezone.utc).isoformat()
-
-    return JSONResponse(
-        status_code=400,
-        content=error_response
-    )
-
-
-@app.exception_handler(AudioProcessingError)
-async def audio_processing_exception_handler(request: Request, exc: AudioProcessingError):
-    """Handle audio processing errors"""
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-
-    error_response = create_error_response(
-        ErrorCodes.AUDIO_PROCESSING_FAILED,
-        str(exc),
-        details=exc.details,
-        request_id=request_id
-    )
-    error_response["error"]["timestamp"] = datetime.now(datetime.timezone.utc).isoformat()
-
-    return JSONResponse(
-        status_code=422,
-        content=error_response
-    )
-
-
-@app.exception_handler(TranscriptionError)
-async def transcription_exception_handler(request: Request, exc: TranscriptionError):
-    """Handle transcription errors"""
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-
-    error_response = create_error_response(
-        ErrorCodes.TRANSCRIPTION_FAILED,
-        str(exc),
-        details=exc.details,
-        request_id=request_id
-    )
-    error_response["error"]["timestamp"] = datetime.now(datetime.timezone.utc).isoformat()
-
-    return JSONResponse(
-        status_code=500,
-        content=error_response
-    )
-
-
-@app.exception_handler(ModelLoadError)
-async def model_load_exception_handler(request: Request, exc: ModelLoadError):
-    """Handle model loading errors"""
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-
-    error_response = create_error_response(
-        ErrorCodes.MODEL_NOT_LOADED,
-        str(exc),
-        details=exc.details,
-        request_id=request_id
-    )
-    error_response["error"]["timestamp"] = datetime.now(datetime.timezone.utc).isoformat()
-
-    return JSONResponse(
-        status_code=503,
-        content=error_response
-    )
-
-
-@app.get(
-    "/",
-    response_model=HealthCheckResponse,
-    tags=["health"],
-    summary="Health Check",
-    description="Check the health and status of the transcription service",
-    responses={
-        200: {
-            "description": "Service is healthy",
-            "model": HealthCheckResponse
-        },
-        503: {
-            "description": "Service is unhealthy",
-            "model": ErrorResponse
-        }
-    }
-)
-async def health_check(settings: Settings = Depends(get_app_settings)):
-    """
-    Enhanced health check endpoint that provides detailed system status information.
-
-    Returns information about:
-    - Service status (healthy/unhealthy/degraded)
-    - Whisper model loading status
-    - System uptime
-    - Disk space availability
-    - Upload directory accessibility
-    """
-    global app_start_time
-
-    # Calculate uptime
-    uptime = time.time() - app_start_time if app_start_time else 0
-
-    # Perform health checks
-    checks = {}
-    status = HealthStatus.HEALTHY
-
-    # Check Whisper model
-    if whisper_model is not None:
-        checks["whisper_model"] = "loaded"
-    else:
-        checks["whisper_model"] = "not_loaded"
-        status = HealthStatus.UNHEALTHY
-
-    # Check disk space
+@app.on_event("startup")
+async def startup_event():
+    """Load Whisper model on startup"""
+    global whisper_model
+    print("🔄 Loading Whisper model...")
     try:
-        disk_usage = shutil.disk_usage(settings.upload_dir)
-        free_gb = disk_usage.free / (1024**3)
-        if free_gb < 1.0:  # Less than 1GB free
-            checks["disk_space"] = f"low ({free_gb:.1f}GB free)"
-            status = HealthStatus.DEGRADED
-        else:
-            checks["disk_space"] = f"sufficient ({free_gb:.1f}GB free)"
-    except Exception:
-        checks["disk_space"] = "unknown"
-        status = HealthStatus.DEGRADED
+        whisper_model = whisper.load_model("base")
+        print("✅ Whisper model loaded successfully")
+    except Exception as e:
+        print(f"❌ Failed to load Whisper model: {e}")
+        raise
 
-    # Check upload directory
-    if os.path.exists(settings.upload_dir) and os.access(settings.upload_dir, os.W_OK):
-        checks["upload_directory"] = "accessible"
-    else:
-        checks["upload_directory"] = "inaccessible"
-        status = HealthStatus.UNHEALTHY
-
-    message = "Zoom Meeting Transcript API is running"
-    if status == HealthStatus.UNHEALTHY:
-        message = "Service is unhealthy"
-    elif status == HealthStatus.DEGRADED:
-        message = "Service is running with degraded performance"
-
-    return HealthCheckResponse(
-        status=status,
-        message=message,
-        timestamp=datetime.now(datetime.timezone.utc),
-        version=settings.app_version,
-        model_loaded=whisper_model is not None,
-        uptime_seconds=uptime,
-        checks=checks
-    )
-
-
-async def validate_uploaded_file(file: UploadFile, settings: Settings) -> FileUploadInfo:
-    """Validate uploaded file"""
-    if not file.filename:
-        raise FileValidationError("No filename provided")
-
-    # Check file extension
-    file_extension = Path(file.filename).suffix.lower()
-    if not is_allowed_file_extension(file.filename):
-        raise FileValidationError(
-            f"Unsupported file type '{file_extension}'. "
-            f"Allowed: {', '.join(settings.allowed_extensions)}"
-        )
-
-    # Check file size
-    file.file.seek(0, 2)  # Seek to end
-    file_size = file.file.tell()
-    file.file.seek(0)  # Reset to beginning
-
-    if file_size == 0:
-        raise FileValidationError("File is empty")
-
-    if file_size > settings.max_file_size:
-        raise FileValidationError(
-            f"File too large ({format_file_size(file_size)}). "
-            f"Maximum allowed: {format_file_size(settings.max_file_size)}"
-        )
-
-    return FileUploadInfo(
-        filename=file.filename,
-        size=file_size,
-        content_type=file.content_type or "application/octet-stream",
-        extension=file_extension
-    )
-
-
-@app.post(
-    "/transcribe",
-    response_class=FileResponse,
-    tags=["transcription"],
-    summary="Transcribe Audio File",
-    description="Upload an audio file and receive a formatted transcript document",
-    responses={
-        200: {
-            "description": "Transcript generated successfully",
-            "content": {
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {
-                    "schema": {"type": "string", "format": "binary"}
-                }
-            }
-        },
-        400: {
-            "description": "Invalid file or request parameters",
-            "model": ErrorResponse
-        },
-        413: {
-            "description": "File too large",
-            "model": ErrorResponse
-        },
-        422: {
-            "description": "Audio processing failed",
-            "model": ErrorResponse
-        },
-        429: {
-            "description": "Rate limit exceeded",
-            "model": ErrorResponse
-        },
-        500: {
-            "description": "Transcription failed",
-            "model": ErrorResponse
-        },
-        503: {
-            "description": "Service unavailable",
-            "model": ErrorResponse
-        }
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "message": "Zoom Meeting Transcript API",
+        "status": "running",
+        "model_loaded": whisper_model is not None
     }
-)
-async def transcribe_audio(
-    request: Request,
-    file: UploadFile = File(
-        ...,
-        description="Audio file to transcribe",
-        media_type="audio/*"
-    ),
-    language: str = Query(
-        default="en",
-        description="Language code for transcription (ISO 639-1)",
-        regex="^[a-z]{2}$"
-    ),
-    settings: Settings = Depends(get_app_settings)
-):
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...),language: Optional[str] = "en"):
     """
-    Upload an audio file and receive a formatted transcript document.
+    Upload an audio file and get the transcript file directly
 
-    **Supported Audio Formats:**
-    - M4A (Apple Audio)
-    - MP4 (MPEG-4 Audio)
-    - WAV (Waveform Audio)
-    - MP3 (MPEG Audio Layer III)
-    - FLAC (Free Lossless Audio Codec)
-    - OGG (Ogg Vorbis)
+    - **file**: Audio file (m4a, mp4, wav, mp3, etc.)
+    - **language**: Language code (default: en)
 
-    **Features:**
-    - Automatic speaker identification
-    - Audio preprocessing and optimization
-    - Conversation flow analysis
-    - Timestamp generation
-    - Word document output with formatting
-
-    **Processing Steps:**
-    1. File validation and security checks
-    2. Audio preprocessing (normalization, silence removal)
-    3. Whisper AI transcription
-    4. Speaker assignment using conversation patterns
-    5. Document generation with timestamps
-
-    **Rate Limits:**
-    - Maximum 2 requests per minute per IP
-    - File size limit: 100MB
-    - Processing timeout: 5 minutes
-
-    **Response:**
-    Returns a Microsoft Word document (.docx) containing the formatted transcript
-    with speaker identification, timestamps, and conversation statistics.
+    Returns the transcript as a downloadable Word document
     """
-    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
-    start_time = time.time()
-
-    # Validate model is loaded
     if not whisper_model:
-        logger.error("Whisper model not loaded", extra={"request_id": request_id})
-        raise ServiceUnavailableException("Transcription service is not available")
+        raise HTTPException(status_code=500, detail="Whisper model not loaded")
 
-    # Validate file
-    try:
-        file_info = await validate_uploaded_file(file, settings)
-        logger.info(f"File validation passed", extra={
-            "request_id": request_id,
-            "filename": file_info.filename,
-            "size": file_info.size,
-            "type": file_info.content_type
-        })
-    except FileValidationError as e:
-        logger.warning(f"File validation failed: {str(e)}", extra={"request_id": request_id})
-        raise BadRequestException(str(e))
+    # Validate file type
+    allowed_extensions = {'.m4a', '.mp4', '.wav', '.mp3', '.flac', '.ogg'}
+    file_extension = Path(file.filename).suffix.lower()
 
-    # Generate unique paths
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}"
+        )
+
+    # Generate unique filename
     unique_id = str(uuid.uuid4())
-    temp_audio_path = os.path.join(settings.upload_dir, f"{unique_id}{file_info.extension}")
+    temp_audio_path = os.path.join(UPLOAD_DIR, f"{unique_id}{file_extension}")
     output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
 
     try:
         # Save uploaded file
-        logger.info("Saving uploaded file", extra={"request_id": request_id})
         with open(temp_audio_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        print(f"📁 Processing file: {file.filename}")
+
         # Preprocess audio
-        logger.info("Starting audio preprocessing", extra={"request_id": request_id})
-        processed_audio = preprocess_audio(temp_audio_path, settings)
+        processed_audio = preprocess_audio(temp_audio_path)
 
         # Transcribe
-        logger.info("Starting transcription", extra={
-            "request_id": request_id,
-            "language": language,
-            "model": settings.whisper_model_name
-        })
-        segments = transcribe_fast(whisper_model, processed_audio, language, settings)
+        segments = transcribe_fast(whisper_model, processed_audio, language)
 
         # Assign speakers
-        logger.info("Assigning speakers", extra={"request_id": request_id})
         speaker_segments = assign_speakers_fast(segments)
 
         # Create transcript
-        logger.info("Creating transcript document", extra={"request_id": request_id})
         create_fast_transcript(speaker_segments, file.filename, output_path)
 
         # Clean up temp files (but keep output_path for FileResponse)
         cleanup_temp_files([temp_audio_path, processed_audio])
 
-        # Verify output file was created
+        # Return the transcript file directly
         if not os.path.exists(output_path):
-            logger.error("Transcript file was not created", extra={"request_id": request_id})
-            raise InternalServerErrorException("Failed to create transcript file")
+            raise HTTPException(status_code=500, detail="Transcript file was not created")
 
-        # Generate clean filename
+        # Generate a clean filename based on original file
         original_name = Path(file.filename).stem
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        clean_filename = f"transcript_{original_name}_{timestamp}.docx"
+        clean_filename = f"transcript_{original_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
 
-        # Log completion
-        duration = time.time() - start_time
-        logger.info(f"Transcription completed successfully", extra={
-            "request_id": request_id,
-            "duration": duration,
-            "output_file": clean_filename
-        })
-
-        # Return file with cleanup
+        # FileResponse will handle cleanup of the output file after sending
         return FileResponse(
             path=output_path,
             filename=clean_filename,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            background=BackgroundTask(cleanup_temp_files, [output_path])
+            background=BackgroundTask(cleanup_temp_files, [output_path])  # Clean up after sending
         )
 
-    except FileValidationError as e:
-        cleanup_temp_files([temp_audio_path])
-        logger.warning(f"File validation error: {str(e)}", extra={"request_id": request_id})
-        raise BadRequestException(str(e))
-
-    except AudioProcessingError as e:
-        cleanup_temp_files([temp_audio_path, processed_audio])
-        logger.error(f"Audio processing error: {str(e)}", extra={"request_id": request_id})
-        raise BadRequestException(f"Audio processing failed: {str(e)}")
-
-    except TranscriptionError as e:
-        cleanup_temp_files([temp_audio_path, processed_audio])
-        logger.error(f"Transcription error: {str(e)}", extra={"request_id": request_id})
-        raise InternalServerErrorException(f"Transcription failed: {str(e)}")
-
     except Exception as e:
-        cleanup_temp_files([temp_audio_path, processed_audio])
-        log_error(logger, request_id, e, "transcription")
-        raise InternalServerErrorException("An unexpected error occurred during transcription")
+        # Clean up on error
+        cleanup_temp_files([temp_audio_path])
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
-def preprocess_audio(audio_path: str, settings: Settings) -> str:
+def preprocess_audio(audio_path):
     """Preprocess audio for optimal Whisper performance"""
-    logger.info("Starting audio preprocessing")
-
+    print("🔧 Preprocessing audio...")
+    
     try:
         audio = AudioSegment.from_file(audio_path)
         duration_seconds = len(audio) / 1000
-        logger.info(f"Audio duration: {duration_seconds:.1f} seconds")
-
+        print(f"   Duration: {duration_seconds:.1f} seconds")
+        
         # Convert to mono
         if audio.channels > 1:
             audio = audio.set_channels(1)
-            logger.info("Converted to mono")
-
-        # Resample to target sample rate
-        if audio.frame_rate != settings.target_sample_rate:
-            audio = audio.set_frame_rate(settings.target_sample_rate)
-            logger.info(f"Resampled to {settings.target_sample_rate}Hz")
-
+        
+        # Resample to 16kHz
+        if audio.frame_rate != TARGET_SAMPLE_RATE:
+            audio = audio.set_frame_rate(TARGET_SAMPLE_RATE)
+        
         # Normalize and trim silence
         audio = audio.normalize()
-        audio = audio.strip_silence(
-            silence_len=settings.min_silence_duration,
-            silence_thresh=settings.silence_threshold
-        )
-        logger.info("Applied normalization and silence trimming")
-
+        audio = audio.strip_silence(silence_len=1000, silence_thresh=SILENCE_THRESHOLD)
+        
         # Handle long audio
-        if duration_seconds > settings.max_audio_length:
-            logger.info(f"Audio too long ({duration_seconds:.1f}s), splitting into chunks")
-            return split_audio_into_chunks(audio, settings)
-
+        if duration_seconds > MAX_AUDIO_LENGTH:
+            return split_audio_into_chunks(audio)
+        
         # Save optimized audio
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
         audio.export(temp_file.name, format='wav')
-        logger.info(f"Preprocessed audio saved to {temp_file.name}")
         return temp_file.name
-
+        
     except Exception as e:
-        logger.error(f"Audio preprocessing failed: {str(e)}", exc_info=True)
-        raise AudioProcessingError(f"Failed to preprocess audio: {str(e)}")
+        print(f"⚠️ Audio preprocessing failed: {e}")
+        return audio_path
 
-def split_audio_into_chunks(audio: AudioSegment, settings: Settings) -> list:
+def split_audio_into_chunks(audio):
     """Split long audio into manageable chunks"""
     chunks = []
-    chunk_length_ms = settings.chunk_size * 1000
-
+    chunk_length_ms = CHUNK_SIZE * 1000
+    
     for i in range(0, len(audio), chunk_length_ms):
         chunk = audio[i:i + chunk_length_ms]
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
         chunk.export(temp_file.name, format='wav')
         chunks.append(temp_file.name)
-
-    logger.info(f"Split audio into {len(chunks)} chunks")
+    
+    print(f"   Split into {len(chunks)} chunks")
     return chunks
 
-def transcribe_fast(model, audio_path, language: str, settings: Settings):
+def transcribe_fast(model, audio_path, language="en"):
     """Fast transcription with optimized settings"""
-    logger.info("Starting transcription")
-
+    print("🎵 Transcribing...")
+    
     config = {
         "language": language,
         "task": "transcribe",
@@ -656,30 +198,30 @@ def transcribe_fast(model, audio_path, language: str, settings: Settings):
         "best_of": 1,
         "fp16": True,
     }
-
+    
     if isinstance(audio_path, list):
-        return transcribe_chunks(model, audio_path, config, settings)
+        return transcribe_chunks(model, audio_path, config)
     else:
         result = model.transcribe(audio_path, **config)
         return process_transcription_result(result, 0)
 
-def transcribe_chunks(model, audio_chunks, config, settings: Settings):
+def transcribe_chunks(model, audio_chunks, config):
     """Transcribe multiple audio chunks"""
     all_segments = []
     time_offset = 0
-
-    for chunk_idx, chunk_path in enumerate(audio_chunks):
-        logger.info(f"Processing chunk {chunk_idx+1}/{len(audio_chunks)}")
+    
+    for i, chunk_path in enumerate(audio_chunks):
+        print(f"   Processing chunk {i+1}/{len(audio_chunks)}...")
         result = model.transcribe(chunk_path, **config)
         segments = process_transcription_result(result, time_offset)
         all_segments.extend(segments)
-        time_offset += settings.chunk_size
-
+        time_offset += CHUNK_SIZE
+        
         try:
             os.unlink(chunk_path)
-        except Exception as e:
-            logger.warning(f"Failed to delete chunk file {chunk_path}: {str(e)}")
-
+        except:
+            pass
+    
     return all_segments
 
 def process_transcription_result(result, time_offset=0):
@@ -778,6 +320,7 @@ def assign_speakers_fast(segments):
 
 def create_fast_transcript(segments, original_filename, output_path):
     """Create transcript with proper conversation flow"""
+    print("📄 Creating transcript...")
 
     doc = Document()
     doc.add_heading("Meeting Transcript", 0)
@@ -870,6 +413,7 @@ def create_fast_transcript(segments, original_filename, output_path):
         doc.add_paragraph(f"{speaker}: {stats['turns']} turns, {stats['words']} words")
 
     doc.save(output_path)
+    print(f"✅ Transcript saved: {output_path}")
 
 def cleanup_temp_files(file_paths):
     """Clean up temporary files"""
@@ -882,9 +426,6 @@ def cleanup_temp_files(file_paths):
                 os.unlink(path)
         except:
             pass
-
-# For Vercel deployment
-handler = app
 
 if __name__ == "__main__":
     import uvicorn
