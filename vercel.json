@@ -16,10 +16,5 @@
     "PYTHONPATH": ".",
     "DEBUG": "false",
     "LOG_LEVEL": "INFO"
-  },
-  "functions": {
-    "main.py": {
-      "maxDuration": 300
-    }
   }
 }
